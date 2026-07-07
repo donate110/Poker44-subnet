@@ -88,6 +88,43 @@ def _amount_bucket(value: float) -> str:
     return "xl"
 
 
+def _slope(values: Sequence[float]) -> float:
+    """Least-squares slope of values against their index; 0.0 if undefined."""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    xs = list(range(n))
+    x_mean = _mean(xs)
+    y_mean = _mean(values)
+    denom = sum((x - x_mean) ** 2 for x in xs)
+    if denom <= 0:
+        return 0.0
+    numer = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, values))
+    return numer / denom
+
+
+def _lag1_autocorr(values: Sequence[float]) -> float:
+    """Pearson correlation between values[:-1] and values[1:]; 0.0 if undefined."""
+    if len(values) < 3:
+        return 0.0
+    head, tail = values[:-1], values[1:]
+    head_std, tail_std = _std(head), _std(tail)
+    if head_std <= 0 or tail_std <= 0:
+        return 0.0
+    head_mean, tail_mean = _mean(head), _mean(tail)
+    covariance = _mean([(a - head_mean) * (b - tail_mean) for a, b in zip(head, tail)])
+    return max(-1.0, min(1.0, covariance / (head_std * tail_std)))
+
+
+def _bigram_rate(pairs: Sequence[Tuple[str, str]], first: str, second: str) -> float:
+    if not pairs:
+        return 0.0
+    from_first = [b for a, b in pairs if a == first]
+    if not from_first:
+        return 0.0
+    return _div(sum(1 for b in from_first if b == second), len(from_first))
+
+
 def hand_features(hand: Dict[str, Any]) -> Dict[str, float]:
     """Scalar behavioral features for a single hand."""
     metadata = hand.get("metadata") or {}
@@ -140,6 +177,11 @@ def hand_features(hand: Dict[str, Any]) -> Dict[str, float]:
         1 for prev, cur in zip(pot_after_bb, pot_after_bb[1:]) if cur + 1e-9 >= prev
     )
 
+    action_bigrams = list(zip(action_types, action_types[1:]))
+    street_transitions = sum(
+        1 for prev, cur in zip(street_names, street_names[1:]) if prev != cur
+    )
+
     return {
         "player_count": float(len(players)),
         "seat_utilization": _div(len(players), max_seats),
@@ -180,6 +222,19 @@ def hand_features(hand: Dict[str, Any]) -> Dict[str, float]:
         "hero_action_share": _div(
             sum(1 for seat in actor_seats if seat == hero_seat and hero_seat > 0), action_count
         ),
+        "street_transition_rate": _div(street_transitions, action_count),
+        "raise_after_call_rate": _bigram_rate(action_bigrams, "call", "raise"),
+        "fold_after_raise_rate": _bigram_rate(action_bigrams, "raise", "fold"),
+        "check_after_check_rate": _bigram_rate(action_bigrams, "check", "check"),
+        "raise_after_raise_rate": _bigram_rate(action_bigrams, "raise", "raise"),
+        "amount_trend_slope": _slope(amounts_bb),
+        "amount_lag1_autocorr": _lag1_autocorr(amounts_bb),
+        "first_action_aggressive": float(
+            bool(action_types) and action_types[0] in ("bet", "raise")
+        ),
+        "last_action_aggressive": float(
+            bool(action_types) and action_types[-1] in ("bet", "raise")
+        ),
     }
 
 
@@ -191,7 +246,7 @@ _EMPTY_HAND_KEYS = tuple(
 _AGGREGATES = ("mean", "std", "min", "max", "q10", "q50", "q90")
 
 
-def _hand_signatures(hand: Dict[str, Any]) -> Tuple[tuple, tuple, tuple, tuple]:
+def _hand_signatures(hand: Dict[str, Any]) -> Tuple[tuple, tuple, tuple, tuple, tuple]:
     actions = hand.get("actions") or []
     action_types = tuple(str((a or {}).get("action_type") or "").lower().strip() for a in actions)
     actor_seq = tuple(
@@ -201,7 +256,39 @@ def _hand_signatures(hand: Dict[str, Any]) -> Tuple[tuple, tuple, tuple, tuple]:
     amount_bucket_seq = tuple(
         _amount_bucket(max(0.0, _f((a or {}).get("normalized_amount_bb")))) for a in actions
     )
-    return action_types, actor_seq, street_seq, amount_bucket_seq
+    # Multiset of adjacent action-type pairs: catches hands that repeat the same
+    # sub-pattern (e.g. "call->raise->fold") even when overall sequence length
+    # differs, which the full-sequence signature above would treat as distinct.
+    bigram_signature = tuple(sorted(Counter(zip(action_types, action_types[1:])).items()))
+    return action_types, actor_seq, street_seq, amount_bucket_seq, bigram_signature
+
+
+_DRIFT_KEYS = (
+    "aggression_share",
+    "fold_share",
+    "action_entropy",
+    "amount_mean_bb",
+    "pot_monotonic_rate",
+)
+
+
+def _chunk_drift_features(per_hand: List[Dict[str, float]]) -> Dict[str, float]:
+    """Second-half minus first-half means, in hand order: near zero for a
+    behaviorally consistent (often scripted) actor, larger for one whose play
+    shifts over the course of the session the chunk represents."""
+    n = len(per_hand)
+    out: Dict[str, float] = {}
+    if n < 2:
+        for key in _DRIFT_KEYS:
+            out[f"drift_{key}"] = 0.0
+        return out
+    midpoint = n // 2
+    first_half, second_half = per_hand[:midpoint], per_hand[midpoint:]
+    for key in _DRIFT_KEYS:
+        first_mean = _mean([row[key] for row in first_half])
+        second_mean = _mean([row[key] for row in second_half])
+        out[f"drift_{key}"] = second_mean - first_mean
+    return out
 
 
 def chunk_features(chunk: List[Dict[str, Any]]) -> Dict[str, float]:
@@ -221,13 +308,14 @@ def chunk_features(chunk: List[Dict[str, Any]]) -> Dict[str, float]:
         out[f"{name}_q50"] = _quantile(series, 0.5)
         out[f"{name}_q90"] = _quantile(series, 0.9)
 
-    action_sigs, actor_sigs, street_sigs, amount_sigs = [], [], [], []
+    action_sigs, actor_sigs, street_sigs, amount_sigs, bigram_sigs = [], [], [], [], []
     for hand in chunk:
-        a_sig, ac_sig, s_sig, amt_sig = _hand_signatures(hand)
+        a_sig, ac_sig, s_sig, amt_sig, bg_sig = _hand_signatures(hand)
         action_sigs.append(a_sig)
         actor_sigs.append(ac_sig)
         street_sigs.append(s_sig)
         amount_sigs.append(amt_sig)
+        bigram_sigs.append(bg_sig)
 
     n = float(len(chunk))
     for tag, signatures in (
@@ -235,9 +323,12 @@ def chunk_features(chunk: List[Dict[str, Any]]) -> Dict[str, float]:
         ("actor", actor_sigs),
         ("street", street_sigs),
         ("amount_bucket", amount_sigs),
+        ("action_bigram", bigram_sigs),
     ):
         out[f"signature_{tag}_top_share"] = _div(max(Counter(signatures).values()), n)
         out[f"signature_{tag}_unique_share"] = _div(len(set(signatures)), n)
+
+    out.update(_chunk_drift_features(per_hand))
 
     return out
 
