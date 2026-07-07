@@ -20,7 +20,13 @@ def add_args(cls, parser: argparse.ArgumentParser) -> None:
     bt.Axon.add_args(parser)
     
     parser.add_argument("--netuid", type=int, help="Subnet netuid", default=126)
-    
+
+    parser.add_argument(
+        "--neuron.name",
+        type=str,
+        default=str(getattr(cls, "neuron_type", "neuron")).lower(),
+        help="Name of the neuron's local state directory (wallet_name/hotkey/netuidN/<neuron.name>).",
+    )
     parser.add_argument(
         "--neuron.device",
         type=str,
@@ -188,6 +194,10 @@ def check_config(cls, config: "bt.Config"):
 
 
 def config(cls) -> bt.Config:
+    # bittensor>=10 skips CLI parsing entirely unless this is explicitly set,
+    # which would otherwise silently ignore every --wallet/--netuid/... flag
+    # and fall back to hardcoded defaults instead of raising or warning.
+    os.environ.setdefault("BT_NO_PARSE_CLI_ARGS", "false")
     parser = argparse.ArgumentParser()
     cls.add_args(parser)
     return bt.Config(parser=parser)
