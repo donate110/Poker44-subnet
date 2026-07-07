@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
@@ -27,6 +28,23 @@ def _parse_bool(value: str | None, *, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _detect_git_commit(repo_root: Path) -> str:
+    """Best-effort ``git rev-parse HEAD`` in repo_root; "" if unavailable."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
 
 
 def _sha256_for_files(paths: Iterable[Path]) -> str:
@@ -79,10 +97,13 @@ def build_local_model_manifest(
             "POKER44_MODEL_REPO_URL",
             str(default_values.get("repo_url", "")),
         ).strip(),
-        "repo_commit": os.getenv(
-            "POKER44_MODEL_REPO_COMMIT",
-            str(default_values.get("repo_commit", "")),
-        ).strip(),
+        "repo_commit": (
+            os.getenv(
+                "POKER44_MODEL_REPO_COMMIT",
+                str(default_values.get("repo_commit", "")),
+            ).strip()
+            or _detect_git_commit(repo_root)
+        ),
         "artifact_url": os.getenv(
             "POKER44_MODEL_ARTIFACT_URL",
             str(default_values.get("artifact_url", "")),

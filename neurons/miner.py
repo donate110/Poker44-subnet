@@ -10,6 +10,7 @@ from typing import Tuple
 import bittensor as bt
 
 from poker44.base.miner import BaseMinerNeuron
+from poker44.miner_model.detector import try_load_detector
 from poker44.utils.model_manifest import (
     build_local_model_manifest,
     evaluate_manifest_compliance,
@@ -20,21 +21,56 @@ from poker44.validator.synapse import DetectionSynapse
 
 class Miner(BaseMinerNeuron):
     """
-    Reference heuristic miner.
+    Reference miner.
 
-    It aggregates simple behavior signals over each chunk and returns a bot-risk
-    score per chunk. The goal is not SOTA accuracy, but a deterministic and
-    explainable baseline that is meaningfully better than random.
+    Scores each chunk with the trained ensemble detector
+    (``poker44/miner_model``) when a trained artifact is available; otherwise
+    falls back to the deterministic heuristic baseline below.
     """
 
     def __init__(self, config=None):
         super(Miner, self).__init__(config=config)
-        bt.logging.info("🤖 Heuristic Poker44 Miner started")
+        self.detector = try_load_detector()
         repo_root = Path(__file__).resolve().parents[1]
-        self.model_manifest = build_local_model_manifest(
-            repo_root=repo_root,
-            implementation_files=[Path(__file__).resolve()],
-            defaults={
+
+        if self.detector is not None:
+            bt.logging.info("🤖 Poker44 Miner started (trained ensemble detector)")
+            implementation_files = [
+                Path(__file__).resolve(),
+                repo_root / "poker44" / "miner_model" / "features.py",
+                repo_root / "poker44" / "miner_model" / "detector.py",
+                repo_root / "poker44" / "miner_model" / "train.py",
+            ]
+            defaults = {
+                "model_name": "poker44-reference-trained-ensemble",
+                "model_version": "1",
+                "framework": "python+scikit-learn",
+                "license": "MIT",
+                "repo_url": "https://github.com/Poker44/Poker44-subnet",
+                "notes": (
+                    "Reference trained miner shipped with the Poker44 subnet: "
+                    "ExtraTrees + RandomForest + HistGradientBoosting soft-vote ensemble "
+                    f"over chunk-level behavioral features. {self.detector.metadata}"
+                ),
+                "open_source": True,
+                "inference_mode": "remote",
+                "training_data_statement": (
+                    "Trained on the public Poker44 training benchmark "
+                    "(https://api.poker44.net/api/v1/benchmark) using only miner-visible "
+                    "hand/action payload fields via poker44.miner_model.train."
+                ),
+                "training_data_sources": ["https://api.poker44.net/api/v1/benchmark"],
+                "private_data_attestation": (
+                    "This miner does not train on validator-private live evaluation labels."
+                ),
+            }
+        else:
+            bt.logging.warning(
+                "No trained detector artifact found; falling back to the heuristic scorer. "
+                "Run `python -m poker44.miner_model.train` to train one."
+            )
+            implementation_files = [Path(__file__).resolve()]
+            defaults = {
                 "model_name": "poker44-reference-heuristic",
                 "model_version": "1",
                 "framework": "python-heuristic",
@@ -50,7 +86,12 @@ class Miner(BaseMinerNeuron):
                 "private_data_attestation": (
                     "This reference miner does not train on validator-only evaluation data."
                 ),
-            },
+            }
+
+        self.model_manifest = build_local_model_manifest(
+            repo_root=repo_root,
+            implementation_files=implementation_files,
+            defaults=defaults,
         )
         self.manifest_compliance = evaluate_manifest_compliance(self.model_manifest)
         self.manifest_digest = manifest_digest(self.model_manifest)
@@ -89,9 +130,12 @@ class Miner(BaseMinerNeuron):
         )
 
     async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
-        """Assign one deterministic bot-risk score per chunk."""
+        """Assign one bot-risk score per chunk."""
         chunks = synapse.chunks or []
-        scores = [self.score_chunk(chunk) for chunk in chunks]
+        if self.detector is not None:
+            scores = self.detector.score_batch(chunks)
+        else:
+            scores = [self.score_chunk(chunk) for chunk in chunks]
         synapse.risk_scores = scores
         synapse.predictions = [s >= 0.5 for s in scores]
         synapse.model_manifest = dict(self.model_manifest)
