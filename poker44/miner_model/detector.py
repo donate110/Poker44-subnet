@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Optional
 
+import bittensor as bt
 import joblib
 
 from poker44.miner_model.features import chunk_features, features_to_row
@@ -57,7 +58,8 @@ _LOAD_FAILED = False
 
 
 def try_load_detector() -> Optional[TrainedDetector]:
-    """Best-effort singleton loader; returns None (once) if no artifact is trained yet."""
+    """Best-effort singleton loader; returns None (once) if the artifact is missing or
+    unloadable (e.g. trained under a different scikit-learn version than is installed)."""
     global _DETECTOR, _LOAD_FAILED
     if _DETECTOR is not None:
         return _DETECTOR
@@ -66,6 +68,9 @@ def try_load_detector() -> Optional[TrainedDetector]:
     try:
         _DETECTOR = TrainedDetector()
         return _DETECTOR
-    except FileNotFoundError:
+    except Exception as exc:
+        bt.logging.warning(
+            f"Trained detector unavailable ({exc!r}); falling back to heuristic scorer."
+        )
         _LOAD_FAILED = True
         return None
