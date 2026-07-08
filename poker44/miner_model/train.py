@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -33,6 +34,17 @@ from poker44.score.scoring import reward
 BENCHMARK_BASE_URL = "https://api.poker44.net/api/v1/benchmark"
 ARTIFACT_PATH = Path(__file__).resolve().parent / "artifacts" / "detector.joblib"
 CACHE_DIR = Path(__file__).resolve().parent / "artifacts" / "benchmark_cache"
+
+# Every public benchmark chunk group is exactly 30 or 40 hands, but the live
+# validator contract explicitly allows "one or many hands" per chunk and warns
+# miners not to assume a fixed size (docs/miner.md). Training only on 30-40
+# hand groups means every aggregate/quantile/signature feature is calibrated
+# to that size and behaves very differently on the small chunks live traffic
+# actually sends. SUB_CHUNK_SIZES generates label-preserving sub-windows of
+# each training group so the model sees the full size range it will be
+# scored on, not just the benchmark's fixed 30/40.
+SUB_CHUNK_SIZES = (1, 2, 3, 5, 8, 12, 20)
+SUB_CHUNKS_PER_SIZE = 2
 
 
 def _get_json(url: str, params: Dict[str, Any] | None = None, timeout: float = 30.0) -> Dict[str, Any]:
@@ -70,7 +82,11 @@ def fetch_source_date_chunks(source_date: str, *, page_limit: int = 24) -> List[
 
 
 def build_examples(source_dates: List[str]) -> List[Dict[str, Any]]:
-    """One example per (chunk group, label) pair, tagged with sourceDate/split."""
+    """One example per (chunk group, label) pair, tagged with sourceDate/split.
+
+    Keeps the raw hand list (not just its features) so callers can generate
+    label-preserving sub-chunks of other sizes before featurizing.
+    """
     examples: List[Dict[str, Any]] = []
     for source_date in source_dates:
         for release_chunk in fetch_source_date_chunks(source_date):
@@ -80,13 +96,49 @@ def build_examples(source_dates: List[str]) -> List[Dict[str, Any]]:
             for group, label in zip(groups, labels):
                 examples.append(
                     {
-                        "features": chunk_features(group),
+                        "group": group,
                         "label": int(label),
                         "source_date": source_date,
                         "split": split,
+                        "augmented": False,
                     }
                 )
     return examples
+
+
+def add_sub_chunk_augmentation(
+    examples: List[Dict[str, Any]],
+    *,
+    sizes: Tuple[int, ...] = SUB_CHUNK_SIZES,
+    samples_per_size: int = SUB_CHUNKS_PER_SIZE,
+    rng: random.Random,
+) -> List[Dict[str, Any]]:
+    """Add label-preserving contiguous sub-windows of each group at smaller sizes."""
+    augmented: List[Dict[str, Any]] = list(examples)
+    for example in examples:
+        group = example["group"]
+        for size in sizes:
+            if size >= len(group):
+                continue
+            for _ in range(samples_per_size):
+                start = rng.randint(0, len(group) - size)
+                augmented.append(
+                    {
+                        "group": group[start : start + size],
+                        "label": example["label"],
+                        "source_date": example["source_date"],
+                        "split": example["split"],
+                        "augmented": True,
+                    }
+                )
+    return augmented
+
+
+def featurize(examples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        {**example, "features": chunk_features(example["group"])}
+        for example in examples
+    ]
 
 
 def split_train_test(
@@ -107,12 +159,19 @@ def split_train_test(
 
 
 def build_ensemble(seed: int = 0) -> VotingClassifier:
+    # min_samples_leaf/max_depth are deliberately conservative: the sub-chunk
+    # augmentation in add_sub_chunk_augmentation() produces many highly
+    # correlated rows per base group (they're overlapping windows of the same
+    # 30/40-hand session), so unlimited-depth trees mostly memorize individual
+    # groups instead of generalizing — and blow up the pickled artifact size
+    # (400 estimators x 2 unlimited-depth forests over ~4-5k rows exceeded
+    # GitHub's 100MB file limit) for no accuracy benefit.
     extra_trees = ExtraTreesClassifier(
-        n_estimators=400, min_samples_leaf=2, class_weight="balanced_subsample",
+        n_estimators=150, max_depth=16, min_samples_leaf=5, class_weight="balanced_subsample",
         random_state=seed, n_jobs=-1,
     )
     random_forest = RandomForestClassifier(
-        n_estimators=400, min_samples_leaf=2, class_weight="balanced_subsample",
+        n_estimators=150, max_depth=16, min_samples_leaf=5, class_weight="balanced_subsample",
         random_state=seed + 1, n_jobs=-1,
     )
     hist_gb = HistGradientBoostingClassifier(
@@ -146,6 +205,32 @@ def evaluate(model: VotingClassifier, examples: List[Dict[str, Any]]) -> Dict[st
     }
 
 
+def evaluate_by_chunk_size(
+    model: VotingClassifier,
+    raw_test_examples: List[Dict[str, Any]],
+    *,
+    sizes: Tuple[int, ...],
+    rng: random.Random,
+) -> Dict[str, Dict[str, float]]:
+    """Diagnostic: reward at each chunk size, built from one sub-window per
+    held-out group per size so results stay strictly within the test dates."""
+    by_size: Dict[str, Dict[str, float]] = {}
+    for size in sizes:
+        sized_examples = []
+        for example in raw_test_examples:
+            group = example["group"]
+            if size >= len(group):
+                continue
+            start = rng.randint(0, len(group) - size)
+            sized_examples.append({**example, "group": group[start : start + size]})
+        sized_examples = featurize(sized_examples)
+        metrics = evaluate(model, sized_examples)
+        if metrics:
+            by_size[str(size)] = metrics
+    by_size["full"] = evaluate(model, featurize(raw_test_examples))
+    return by_size
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release-dates", type=int, default=14, help="How many recent release dates to train on.")
@@ -158,14 +243,20 @@ def main() -> None:
     source_dates = list_release_dates(args.release_dates)
     print(f"Training on release dates: {source_dates}")
 
-    examples = build_examples(source_dates)
-    print(f"Loaded {len(examples)} labeled chunk examples.")
+    raw_examples = build_examples(source_dates)
+    print(f"Loaded {len(raw_examples)} labeled chunk examples "
+          f"(benchmark groups are always 30 or 40 hands).")
 
-    train_examples, test_examples = split_train_test(examples, holdout_dates=args.holdout_dates)
-    train_dates = sorted({ex["source_date"] for ex in train_examples})
-    test_dates = sorted({ex["source_date"] for ex in test_examples})
-    print(f"Train: {len(train_examples)} examples over {train_dates}")
-    print(f"Test:  {len(test_examples)} examples over {test_dates}")
+    raw_train, raw_test = split_train_test(raw_examples, holdout_dates=args.holdout_dates)
+    train_dates = sorted({ex["source_date"] for ex in raw_train})
+    test_dates = sorted({ex["source_date"] for ex in raw_test})
+
+    rng = random.Random(args.seed)
+    train_examples = featurize(add_sub_chunk_augmentation(raw_train, rng=rng))
+    test_examples = featurize(raw_test)
+    print(f"Train: {len(train_examples)} examples over {train_dates} "
+          f"({len(raw_train)} base groups + sub-chunk augmentation at sizes {SUB_CHUNK_SIZES})")
+    print(f"Test:  {len(test_examples)} examples over {test_dates} (unaugmented, original 30/40-hand groups)")
 
     X_train = np.array([features_to_row(ex["features"]) for ex in train_examples], dtype=float)
     y_train = np.array([ex["label"] for ex in train_examples])
@@ -174,7 +265,12 @@ def main() -> None:
     model.fit(X_train, y_train)
 
     metrics = evaluate(model, test_examples)
-    print("Held-out evaluation:", json.dumps(metrics, indent=2))
+    print("Held-out evaluation (original chunk sizes):", json.dumps(metrics, indent=2))
+
+    size_metrics = evaluate_by_chunk_size(
+        model, raw_test, sizes=SUB_CHUNK_SIZES, rng=random.Random(args.seed + 1)
+    )
+    print("Held-out evaluation by chunk size:", json.dumps(size_metrics, indent=2))
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -188,12 +284,15 @@ def main() -> None:
                 "test_source_dates": test_dates,
                 "train_rows": len(train_examples),
                 "test_rows": len(test_examples),
+                "sub_chunk_sizes": list(SUB_CHUNK_SIZES),
                 "metrics": metrics,
+                "metrics_by_chunk_size": size_metrics,
             },
         },
         output_path,
+        compress=3,
     )
-    print(f"Wrote {output_path}")
+    print(f"Wrote {output_path} ({output_path.stat().st_size / 1e6:.1f} MB)")
 
 
 if __name__ == "__main__":

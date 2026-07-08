@@ -25,7 +25,7 @@ model/*
 
 models/*
 runs/*
-poker44/miner_model/artifacts/benchmark_cache/
+poker44/miner_model/artifacts/
 # C extensions
 *.so
 
