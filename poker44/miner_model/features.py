@@ -341,5 +341,25 @@ FEATURE_NAMES = sorted(
 )
 
 
+# Absolute bet/pot/stack magnitude ("_bb") features and the raw (non-scale-
+# invariant) bet-size trend slope split trees on benchmark-scale thresholds.
+# A competitor who instrumented real live-validator capture (not just the
+# public benchmark) measured these 2-11 sigma out-of-distribution between
+# benchmark and live traffic (live pots/bets run at roughly half benchmark
+# scale) — the single biggest evidenced source of benchmark-to-live
+# generalization failure found so far. `amount_lag1_autocorr` is a Pearson
+# correlation, which is scale-invariant by construction, so it is kept.
+_FRAGILE_MAGNITUDE_SUBSTRING = "_bb"
+_FRAGILE_MAGNITUDE_EXACT = {
+    name for name in FEATURE_NAMES if name.startswith("amount_trend_slope")
+}
+
+ROBUST_FEATURE_NAMES = [
+    name
+    for name in FEATURE_NAMES
+    if _FRAGILE_MAGNITUDE_SUBSTRING not in name and name not in _FRAGILE_MAGNITUDE_EXACT
+]
+
+
 def features_to_row(features: Dict[str, float]) -> List[float]:
     return [float(features.get(name, 0.0)) for name in FEATURE_NAMES]

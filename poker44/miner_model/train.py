@@ -28,8 +28,10 @@ from sklearn.ensemble import (
 )
 from sklearn.metrics import average_precision_score, log_loss, roc_auc_score
 
-from poker44.miner_model.features import FEATURE_NAMES, chunk_features, features_to_row
+from poker44.miner_model.features import ROBUST_FEATURE_NAMES, chunk_features
 from poker44.score.scoring import reward
+
+TRAINING_FEATURE_NAMES = ROBUST_FEATURE_NAMES
 
 BENCHMARK_BASE_URL = "https://api.poker44.net/api/v1/benchmark"
 ARTIFACT_PATH = Path(__file__).resolve().parent / "artifacts" / "detector.joblib"
@@ -39,12 +41,18 @@ CACHE_DIR = Path(__file__).resolve().parent / "artifacts" / "benchmark_cache"
 # validator contract explicitly allows "one or many hands" per chunk and warns
 # miners not to assume a fixed size (docs/miner.md). Training only on 30-40
 # hand groups means every aggregate/quantile/signature feature is calibrated
-# to that size and behaves very differently on the small chunks live traffic
-# actually sends. SUB_CHUNK_SIZES generates label-preserving sub-windows of
-# each training group so the model sees the full size range it will be
-# scored on, not just the benchmark's fixed 30/40.
+# to that size and behaves very differently at other sizes. SUB_CHUNK_SIZES
+# covers smaller windows for general size-robustness. LARGE_CHUNK_SIZES
+# specifically targets 60-120 hands: a competitor who instrumented real
+# live-validator capture (poker44_ml/live_capture.py in Travis861/Poker44_v1,
+# the #1-by-score miner as of 2026-07-09) measured actual live chunks at
+# 80-100 hands -- bigger than the benchmark, not smaller. Built via
+# concatenating whole same-label groups rather than sub-windowing since no
+# single benchmark group is long enough on its own.
 SUB_CHUNK_SIZES = (1, 2, 3, 5, 8, 12, 20)
 SUB_CHUNKS_PER_SIZE = 2
+LARGE_CHUNK_SIZES = (60, 80, 100, 120)
+LARGE_CHUNKS_PER_SIZE = 1
 
 
 def _get_json(url: str, params: Dict[str, Any] | None = None, timeout: float = 30.0) -> Dict[str, Any]:
@@ -134,6 +142,50 @@ def add_sub_chunk_augmentation(
     return augmented
 
 
+def _concat_chunk(pool: List[Dict[str, Any]], size: int, rng: random.Random) -> Tuple[list, str]:
+    """Concatenate whole groups (no single group reaches 60+ hands) up to `size` hands."""
+    order = list(pool)
+    rng.shuffle(order)
+    concatenated: List[dict] = []
+    idx = 0
+    while len(concatenated) < size:
+        concatenated.extend(order[idx % len(order)]["group"])
+        idx += 1
+    return concatenated[:size], order[0]["source_date"]
+
+
+def add_concat_augmentation(
+    examples: List[Dict[str, Any]],
+    *,
+    sizes: Tuple[int, ...] = LARGE_CHUNK_SIZES,
+    samples_per_size: int = LARGE_CHUNKS_PER_SIZE,
+    rng: random.Random,
+) -> List[Dict[str, Any]]:
+    """Add label-preserving large chunks built by concatenating several
+    same-label groups, since no single benchmark group reaches 60+ hands."""
+    by_label: Dict[int, List[Dict[str, Any]]] = {}
+    for example in examples:
+        by_label.setdefault(example["label"], []).append(example)
+
+    augmented: List[Dict[str, Any]] = list(examples)
+    for label, pool in by_label.items():
+        if len(pool) < 2:
+            continue
+        for size in sizes:
+            for _ in range(samples_per_size):
+                group, source_date = _concat_chunk(pool, size, rng)
+                augmented.append(
+                    {
+                        "group": group,
+                        "label": label,
+                        "source_date": source_date,
+                        "split": None,
+                        "augmented": True,
+                    }
+                )
+    return augmented
+
+
 def featurize(examples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [
         {**example, "features": chunk_features(example["group"])}
@@ -184,10 +236,14 @@ def build_ensemble(seed: int = 0) -> VotingClassifier:
     )
 
 
+def _to_row(features: Dict[str, float]) -> List[float]:
+    return [float(features.get(name, 0.0)) for name in TRAINING_FEATURE_NAMES]
+
+
 def evaluate(model: VotingClassifier, examples: List[Dict[str, Any]]) -> Dict[str, float]:
     if not examples:
         return {}
-    rows = [features_to_row(ex["features"]) for ex in examples]
+    rows = [_to_row(ex["features"]) for ex in examples]
     labels = np.array([ex["label"] for ex in examples])
     scores = model.predict_proba(np.array(rows, dtype=float))[:, 1]
 
@@ -209,13 +265,16 @@ def evaluate_by_chunk_size(
     model: VotingClassifier,
     raw_test_examples: List[Dict[str, Any]],
     *,
-    sizes: Tuple[int, ...],
+    window_sizes: Tuple[int, ...],
+    concat_sizes: Tuple[int, ...],
     rng: random.Random,
 ) -> Dict[str, Dict[str, float]]:
-    """Diagnostic: reward at each chunk size, built from one sub-window per
-    held-out group per size so results stay strictly within the test dates."""
+    """Diagnostic: reward at each chunk size, staying strictly within the
+    held-out test groups/dates. Sizes below a group's length are built by
+    sub-windowing; sizes above it (60-120, the live range) are built by
+    concatenating several held-out groups, same as the training augmentation."""
     by_size: Dict[str, Dict[str, float]] = {}
-    for size in sizes:
+    for size in window_sizes:
         sized_examples = []
         for example in raw_test_examples:
             group = example["group"]
@@ -227,6 +286,17 @@ def evaluate_by_chunk_size(
         metrics = evaluate(model, sized_examples)
         if metrics:
             by_size[str(size)] = metrics
+
+    concat_examples = add_concat_augmentation(
+        raw_test_examples, sizes=concat_sizes, samples_per_size=20, rng=rng
+    )
+    concat_only = [ex for ex in concat_examples if ex.get("augmented")]
+    for size in concat_sizes:
+        sized = [ex for ex in concat_only if len(ex["group"]) == size]
+        metrics = evaluate(model, featurize(sized))
+        if metrics:
+            by_size[str(size)] = metrics
+
     by_size["full"] = evaluate(model, featurize(raw_test_examples))
     return by_size
 
@@ -252,13 +322,18 @@ def main() -> None:
     test_dates = sorted({ex["source_date"] for ex in raw_test})
 
     rng = random.Random(args.seed)
-    train_examples = featurize(add_sub_chunk_augmentation(raw_train, rng=rng))
+    augmented_train = add_sub_chunk_augmentation(raw_train, rng=rng)
+    augmented_train = add_concat_augmentation(augmented_train, rng=rng)
+    train_examples = featurize(augmented_train)
     test_examples = featurize(raw_test)
     print(f"Train: {len(train_examples)} examples over {train_dates} "
-          f"({len(raw_train)} base groups + sub-chunk augmentation at sizes {SUB_CHUNK_SIZES})")
+          f"({len(raw_train)} base groups + sub-chunk sizes {SUB_CHUNK_SIZES} "
+          f"+ concatenated large-chunk sizes {LARGE_CHUNK_SIZES})")
     print(f"Test:  {len(test_examples)} examples over {test_dates} (unaugmented, original 30/40-hand groups)")
+    print(f"Training on {len(TRAINING_FEATURE_NAMES)} robust features "
+          f"(absolute bet/pot/stack magnitude features excluded).")
 
-    X_train = np.array([features_to_row(ex["features"]) for ex in train_examples], dtype=float)
+    X_train = np.array([_to_row(ex["features"]) for ex in train_examples], dtype=float)
     y_train = np.array([ex["label"] for ex in train_examples])
 
     model = build_ensemble(seed=args.seed)
@@ -268,7 +343,9 @@ def main() -> None:
     print("Held-out evaluation (original chunk sizes):", json.dumps(metrics, indent=2))
 
     size_metrics = evaluate_by_chunk_size(
-        model, raw_test, sizes=SUB_CHUNK_SIZES, rng=random.Random(args.seed + 1)
+        model, raw_test,
+        window_sizes=SUB_CHUNK_SIZES, concat_sizes=LARGE_CHUNK_SIZES,
+        rng=random.Random(args.seed + 1),
     )
     print("Held-out evaluation by chunk size:", json.dumps(size_metrics, indent=2))
 
@@ -277,7 +354,7 @@ def main() -> None:
     joblib.dump(
         {
             "model": model,
-            "feature_names": FEATURE_NAMES,
+            "feature_names": TRAINING_FEATURE_NAMES,
             "metadata": {
                 "trained_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "train_source_dates": train_dates,
@@ -285,6 +362,7 @@ def main() -> None:
                 "train_rows": len(train_examples),
                 "test_rows": len(test_examples),
                 "sub_chunk_sizes": list(SUB_CHUNK_SIZES),
+                "large_chunk_sizes": list(LARGE_CHUNK_SIZES),
                 "metrics": metrics,
                 "metrics_by_chunk_size": size_metrics,
             },
