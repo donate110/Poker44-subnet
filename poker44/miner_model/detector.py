@@ -1,6 +1,8 @@
 """Runtime scorer that loads the trained detector artifact produced by train.py."""
 from __future__ import annotations
 
+import os
+import warnings
 from pathlib import Path
 from typing import List, Optional
 
@@ -9,13 +11,26 @@ import joblib
 
 from poker44.miner_model.features import chunk_features, features_to_row
 
-ARTIFACT_PATH = Path(__file__).resolve().parent / "artifacts" / "detector.joblib"
+# Cosmetic: numpy rows are correctly column-aligned; this only fires for
+# LightGBM-backed artifacts (fit() stores a feature-name signature, checked
+# again on predict) and never affects the actual scores.
+warnings.filterwarnings("ignore", message="X does not have valid feature names", category=UserWarning)
+
+DEFAULT_ARTIFACT_PATH = Path(__file__).resolve().parent / "artifacts" / "detector.joblib"
+
+
+def _resolve_artifact_path() -> Path:
+    # Lets a second miner instance (different wallet/hotkey, same code) serve a
+    # different trained model, e.g. POKER44_DETECTOR_ARTIFACT_PATH=train_h02_lgbm.joblib.
+    override = os.getenv("POKER44_DETECTOR_ARTIFACT_PATH", "").strip()
+    return Path(override) if override else DEFAULT_ARTIFACT_PATH
 
 
 class TrainedDetector:
     """Loads once, scores many chunks. Raises if the artifact is missing."""
 
-    def __init__(self, artifact_path: Path = ARTIFACT_PATH):
+    def __init__(self, artifact_path: Optional[Path] = None):
+        artifact_path = artifact_path or _resolve_artifact_path()
         if not artifact_path.exists():
             raise FileNotFoundError(
                 f"No trained model at {artifact_path}. Run "
