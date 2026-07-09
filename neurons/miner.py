@@ -35,24 +35,39 @@ class Miner(BaseMinerNeuron):
         repo_root = Path(__file__).resolve().parents[1]
 
         if self.detector is not None:
-            bt.logging.info("🤖 Poker44 Miner started (trained ensemble detector)")
+            backend = self.detector.metadata.get("backend", "sklearn_ensemble")
+            bt.logging.info(f"🤖 Poker44 Miner started (trained detector, backend={backend})")
             implementation_files = [
                 Path(__file__).resolve(),
                 repo_root / "poker44" / "miner_model" / "features.py",
                 repo_root / "poker44" / "miner_model" / "detector.py",
+                repo_root / "poker44" / "miner_model" / "calibration.py",
                 repo_root / "poker44" / "miner_model" / "train.py",
+                repo_root / "train_h02_lgbm.py",
             ]
-            defaults = {
-                "model_name": "poker44-reference-trained-ensemble",
-                "model_version": "1",
-                "framework": "python+scikit-learn",
-                "license": "MIT",
-                "repo_url": "https://github.com/Poker44/Poker44-subnet",
-                "notes": (
+            if backend == "lightgbm":
+                model_name = "poker44-reference-trained-lgbm"
+                framework = "python+lightgbm"
+                notes = (
+                    "Reference trained miner: LightGBM base model + FprCeilingCalibrator "
+                    "(isotonic regression + reward-aware boundary remap) over the same "
+                    f"chunk-level behavioral feature set as the sklearn variant. {self.detector.metadata}"
+                )
+            else:
+                model_name = "poker44-reference-trained-ensemble"
+                framework = "python+scikit-learn"
+                notes = (
                     "Reference trained miner shipped with the Poker44 subnet: "
                     "ExtraTrees + RandomForest + HistGradientBoosting soft-vote ensemble "
                     f"over chunk-level behavioral features. {self.detector.metadata}"
-                ),
+                )
+            defaults = {
+                "model_name": model_name,
+                "model_version": "1",
+                "framework": framework,
+                "license": "MIT",
+                "repo_url": "https://github.com/Poker44/Poker44-subnet",
+                "notes": notes,
                 "open_source": True,
                 "inference_mode": "remote",
                 "training_data_statement": (

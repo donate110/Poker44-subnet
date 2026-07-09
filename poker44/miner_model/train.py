@@ -357,6 +357,7 @@ def main() -> None:
             "feature_names": TRAINING_FEATURE_NAMES,
             "metadata": {
                 "trained_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "backend": "sklearn_ensemble",
                 "train_source_dates": train_dates,
                 "test_source_dates": test_dates,
                 "train_rows": len(train_examples),
