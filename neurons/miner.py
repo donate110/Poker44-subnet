@@ -10,6 +10,7 @@ from typing import Tuple
 import bittensor as bt
 
 from poker44.base.miner import BaseMinerNeuron
+from poker44.miner_model import live_capture
 from poker44.miner_model.detector import try_load_detector
 from poker44.utils.model_manifest import (
     build_local_model_manifest,
@@ -141,6 +142,11 @@ class Miner(BaseMinerNeuron):
         synapse.model_manifest = dict(self.model_manifest)
         bt.logging.info(f"Miner Predctions: {synapse.predictions}")
         bt.logging.info(f"Scored {len(chunks)} chunks with heuristic risks.")
+
+        validator_hotkey = getattr(getattr(synapse, "dendrite", None), "hotkey", None)
+        live_capture.capture(chunks, scores, self.uid, validator_hotkey)
+        live_capture.capture_batch(chunks, scores, self.uid, validator_hotkey)
+
         return synapse
 
     @staticmethod
