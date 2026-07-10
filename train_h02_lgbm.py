@@ -1,20 +1,30 @@
-"""Train a LightGBM detector for the sn1/h02 miner.
+"""Train a LightGBM + MLP rank-vote blend detector for the sn1/h02 miner.
 
 Reuses the same public-benchmark fetch, feature extraction, and chunk-size
 augmentation as poker44/miner_model/train.py (that pipeline is already
 evidence-based: ROBUST_FEATURE_NAMES drops absolute bet/pot/stack magnitude
 features that are 2-11 sigma out-of-distribution live vs benchmark, and
-LARGE_CHUNK_SIZES covers the live-realistic 60-120 hand range). What's new
-here, informed by the top-4 miners as of 2026-07-09:
+LARGE_CHUNK_SIZES covers the live-realistic 60-120 hand range -- a target
+range independently corroborated by a second top miner's training docs,
+which measured live groups at ~80-105 hands).
 
-- LightGBM instead of the ExtraTrees+RandomForest+HistGB ensemble the h01
-  miner runs (a different model family, so h01 and h02 aren't just two
-  copies of the same thing under different wallets).
+What's new here, informed by top miners as of 2026-07-10 (UID 161
+"high-poker-2", UID 246 "poker44-benchmark-supervised"):
+
+- A second, decorrelated base member: an MLPClassifier (StandardScaler ->
+  neural net) alongside the LightGBM tree model, blended by RANK vote
+  (poker44/miner_model/blend.py) rather than averaging raw probabilities --
+  the two model families produce differently-scaled/shaped score
+  distributions, and rank voting is immune to that scale drift. This
+  mirrors UID 161's "HG2Blend" (rank-voted tree stack + monotone booster +
+  PCA->MLP); we use two decorrelated members instead of three, skipping the
+  monotone-constrained booster since we don't yet have a validated
+  sign-stable feature list for it.
 - FprCeilingCalibrator (poker44/miner_model/calibration.py): isotonic
   regression + a boundary remap that grid-searches the 0.5 cut to maximize
   reward while keeping FPR under the reward formula's 5% ceiling, fit on a
-  held-out split the base model never trained on. Monotone, so ranking (and
-  average precision) is preserved exactly.
+  held-out split neither base member trained on. Monotone, so ranking (and
+  average precision) is preserved exactly. Now fit on the blended score.
 
 Usage:
     python train_h02_lgbm.py --release-dates 14 --holdout-dates 2
@@ -35,11 +45,16 @@ import numpy as np
 # Cosmetic: numpy rows are correctly column-aligned; this only fires because
 # LightGBM stores a feature-name signature from fit() and checks it on predict.
 warnings.filterwarnings("ignore", message="X does not have valid feature names", category=UserWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.neural_network")
 
 from lightgbm import LGBMClassifier
 from sklearn.metrics import average_precision_score, log_loss, roc_auc_score
 from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
+from poker44.miner_model.blend import RankVoteBlend
 from poker44.miner_model.calibration import CalibratedClassifier, FprCeilingCalibrator
 from poker44.miner_model.features import ROBUST_FEATURE_NAMES
 from poker44.miner_model.train import (
@@ -140,19 +155,31 @@ def main() -> None:
     )
 
     n_pos, n_neg = int(y_fit.sum()), int((y_fit == 0).sum())
-    model = LGBMClassifier(
+    lgbm = LGBMClassifier(
         n_estimators=400, learning_rate=0.03, num_leaves=31,
         max_depth=-1, min_child_samples=20, subsample=0.9, subsample_freq=1,
         colsample_bytree=0.8, reg_lambda=2.0, random_state=args.seed, n_jobs=-1,
         verbose=-1, class_weight="balanced" if abs(n_pos - n_neg) > 0.1 * (n_pos + n_neg) else None,
     )
-    model.fit(X_fit, y_fit)
+    lgbm.fit(X_fit, y_fit)
 
-    raw_cal_scores = model.predict_proba(X_cal)[:, 1]
+    mlp = make_pipeline(
+        StandardScaler(),
+        MLPClassifier(
+            hidden_layer_sizes=(64, 32), alpha=1e-3, learning_rate_init=1e-3,
+            max_iter=500, early_stopping=True, n_iter_no_change=15,
+            random_state=args.seed,
+        ),
+    )
+    mlp.fit(X_fit, y_fit)
+
+    blend = RankVoteBlend([("lgbm", lgbm), ("mlp", mlp)], weights=[0.6, 0.4])
+
+    raw_cal_scores = blend.predict_proba(X_cal)[:, 1]
     calibrator = FprCeilingCalibrator(max_fpr=args.max_fpr).fit(raw_cal_scores, y_cal)
     print(f"Calibrator boundary cut={calibrator.cut_:.4f} (max_fpr={args.max_fpr})")
 
-    calibrated_model = CalibratedClassifier(model, calibrator)
+    calibrated_model = CalibratedClassifier(blend, calibrator)
 
     metrics = evaluate(calibrated_model, test_examples)
     print("Held-out evaluation (original chunk sizes):", json.dumps(metrics, indent=2))
@@ -168,7 +195,9 @@ def main() -> None:
             "feature_names": TRAINING_FEATURE_NAMES,
             "metadata": {
                 "trained_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "backend": "lightgbm",
+                "backend": "lightgbm_mlp_rankblend",
+                "blend_members": ["lgbm", "mlp"],
+                "blend_weights": [0.6, 0.4],
                 "train_source_dates": train_dates,
                 "test_source_dates": test_dates,
                 "train_rows": len(train_examples),

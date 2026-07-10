@@ -42,14 +42,16 @@ class Miner(BaseMinerNeuron):
                 repo_root / "poker44" / "miner_model" / "features.py",
                 repo_root / "poker44" / "miner_model" / "detector.py",
                 repo_root / "poker44" / "miner_model" / "calibration.py",
+                repo_root / "poker44" / "miner_model" / "blend.py",
                 repo_root / "poker44" / "miner_model" / "train.py",
                 repo_root / "train_h02_lgbm.py",
             ]
-            if backend == "lightgbm":
+            if backend.startswith("lightgbm"):
                 model_name = "poker44-reference-trained-lgbm"
-                framework = "python+lightgbm"
+                framework = "python+lightgbm+scikit-learn"
                 notes = (
-                    "Reference trained miner: LightGBM base model + FprCeilingCalibrator "
+                    "Reference trained miner: LightGBM + MLP rank-vote blend "
+                    "(poker44.miner_model.blend.RankVoteBlend) + FprCeilingCalibrator "
                     "(isotonic regression + reward-aware boundary remap) over the same "
                     f"chunk-level behavioral feature set as the sklearn variant. {self.detector.metadata}"
                 )
