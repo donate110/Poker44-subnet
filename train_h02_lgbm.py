@@ -1,4 +1,4 @@
-"""Train a LightGBM + MLP rank-vote blend detector for the sn1/h02 miner.
+"""Train a LightGBM + MLP calibrated-average blend detector for the sn1/h02 miner.
 
 Reuses the same public-benchmark fetch, feature extraction, and chunk-size
 augmentation as poker44/miner_model/train.py (that pipeline is already
@@ -8,23 +8,27 @@ LARGE_CHUNK_SIZES covers the live-realistic 60-120 hand range -- a target
 range independently corroborated by a second top miner's training docs,
 which measured live groups at ~80-105 hands).
 
-What's new here, informed by top miners as of 2026-07-10 (UID 161
-"high-poker-2", UID 246 "poker44-benchmark-supervised"):
+Two decorrelated base members -- LightGBM and an MLPClassifier
+(StandardScaler -> neural net) -- combined via
+poker44.miner_model.blend.CalibratedAverageBlend: each member gets its own
+isotonic calibrator fit once offline, and inference averages the calibrated
+probabilities. An earlier version of this file used RankVoteBlend (rank
+voting within each call, the approach a top-scoring miner's "HG2Blend"
+uses). That measurably hurt live performance: h02 scored 0.309 in its first
+live round despite a *better* offline held-out score than h01's plain
+probability-averaging ensemble (0.958 vs 0.923), which scored 0.485 live.
+The reason: this subnet's validator pools predictions across many separate
+forward() calls into a rolling buffer and computes a rank-based reward over
+that pooled buffer (see poker44.score.scoring.reward), not per-call --
+rank-normalizing within each individual call forces every request into the
+same flat [0, 1] spread regardless of true separability, which throws away
+exactly the confidence information the pooled ranking needs. See
+poker44/miner_model/blend.py's module docstring for the full writeup.
 
-- A second, decorrelated base member: an MLPClassifier (StandardScaler ->
-  neural net) alongside the LightGBM tree model, blended by RANK vote
-  (poker44/miner_model/blend.py) rather than averaging raw probabilities --
-  the two model families produce differently-scaled/shaped score
-  distributions, and rank voting is immune to that scale drift. This
-  mirrors UID 161's "HG2Blend" (rank-voted tree stack + monotone booster +
-  PCA->MLP); we use two decorrelated members instead of three, skipping the
-  monotone-constrained booster since we don't yet have a validated
-  sign-stable feature list for it.
-- FprCeilingCalibrator (poker44/miner_model/calibration.py): isotonic
-  regression + a boundary remap that grid-searches the 0.5 cut to maximize
-  reward while keeping FPR under the reward formula's 5% ceiling, fit on a
-  held-out split neither base member trained on. Monotone, so ranking (and
-  average precision) is preserved exactly. Now fit on the blended score.
+FprCeilingCalibrator (poker44/miner_model/calibration.py) is still applied
+on top of the blend for interpretability of the 0.5 boundary, though note
+the reward formula is fully rank-based -- the boundary itself doesn't
+change the score, only where "predictions" reads as True/False.
 
 Usage:
     python train_h02_lgbm.py --release-dates 14 --holdout-dates 2
@@ -54,7 +58,7 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from poker44.miner_model.blend import RankVoteBlend
+from poker44.miner_model.blend import CalibratedAverageBlend
 from poker44.miner_model.calibration import CalibratedClassifier, FprCeilingCalibrator
 from poker44.miner_model.features import ROBUST_FEATURE_NAMES
 from poker44.miner_model.train import (
@@ -173,7 +177,8 @@ def main() -> None:
     )
     mlp.fit(X_fit, y_fit)
 
-    blend = RankVoteBlend([("lgbm", lgbm), ("mlp", mlp)], weights=[0.6, 0.4])
+    blend = CalibratedAverageBlend([("lgbm", lgbm), ("mlp", mlp)], weights=[0.6, 0.4])
+    blend.fit(X_cal, y_cal)
 
     raw_cal_scores = blend.predict_proba(X_cal)[:, 1]
     calibrator = FprCeilingCalibrator(max_fpr=args.max_fpr).fit(raw_cal_scores, y_cal)
@@ -195,7 +200,7 @@ def main() -> None:
             "feature_names": TRAINING_FEATURE_NAMES,
             "metadata": {
                 "trained_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "backend": "lightgbm_mlp_rankblend",
+                "backend": "lightgbm_mlp_calibrated_blend",
                 "blend_members": ["lgbm", "mlp"],
                 "blend_weights": [0.6, 0.4],
                 "train_source_dates": train_dates,
