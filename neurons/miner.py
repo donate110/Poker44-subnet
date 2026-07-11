@@ -158,7 +158,8 @@ class Miner(BaseMinerNeuron):
         synapse.predictions = [s >= 0.5 for s in scores]
         synapse.model_manifest = dict(self.model_manifest)
         bt.logging.info(f"Miner Predctions: {synapse.predictions}")
-        bt.logging.info(f"Scored {len(chunks)} chunks with heuristic risks.")
+        scorer = "trained detector" if self.detector is not None else "heuristic"
+        bt.logging.info(f"Scored {len(chunks)} chunks with {scorer}.")
 
         validator_hotkey = getattr(getattr(synapse, "dendrite", None), "hotkey", None)
         live_capture.capture(chunks, scores, self.uid, validator_hotkey)
